@@ -1,5 +1,4 @@
 
-   """
 MindBill Pro - Behavioral Health Denial & Appeal Manager
 Run:  streamlit run app.py
 
