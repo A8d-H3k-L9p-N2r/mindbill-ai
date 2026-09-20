@@ -1,14 +1,12 @@
-"""
-MindBill Pro - Behavioral Health Denial & Appeal Manager
-Run:  streamlit run app.py
-
-Features
-- Real login (PBKDF2 password hashing, lockout, session timeout, roles)
-- Denial case tracker (SQLite) with deadlines and dashboard
-- Appeal letter (TXT/PDF), AR call script, corrected-claim 837P export
-- Payer directory (you enter verified appeal addresses / payer IDs)
-- Audit log
-"""
+# MindBill Pro - Behavioral Health Denial & Appeal Manager
+# Run:  streamlit run app.py
+#
+# Features
+# - Real login (PBKDF2 password hashing, lockout, session timeout, roles)
+# - Denial case tracker (SQLite) with deadlines and dashboard
+# - Appeal letter (TXT/PDF), AR call script, corrected-claim 837P export
+# - Payer directory (you enter verified appeal addresses / payer IDs)
+# - Audit log
 import hashlib
 import hmac
 import io
@@ -16,9 +14,11 @@ import json
 import os
 import re
 import secrets
+import smtplib
 import sqlite3
 from contextlib import closing
 from datetime import date, datetime, timedelta
+from email.message import EmailMessage
 from xml.sax.saxutils import escape
 
 import pandas as pd
@@ -36,7 +36,7 @@ except ImportError:
 # ----------------------------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------------------------
-DB_PATH = os.environ.get("MINDBILL_DB", "mindbill.db")
+DB_PATH = os.environ.get("MINDBILL_DB", "mindbill_pro.db")
 SESSION_TIMEOUT_MIN = 30
 MAX_FAILED_LOGINS = 5
 LOCK_MINUTES = 15
@@ -203,12 +203,22 @@ def init_db():
                 status TEXT DEFAULT 'New', appeal_level TEXT DEFAULT 'Initial denial',
                 recovered REAL DEFAULT 0, rationale TEXT, notes TEXT
             );
+            CREATE TABLE IF NOT EXISTS otp_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL, purpose TEXT NOT NULL,
+                code_hash TEXT NOT NULL, salt TEXT NOT NULL,
+                created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0, used INTEGER NOT NULL DEFAULT 0
+            );
             CREATE TABLE IF NOT EXISTS audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts TEXT NOT NULL, username TEXT, action TEXT NOT NULL, detail TEXT
             );
             """
         )
+        if "email" not in [r[1] for r in c.execute("PRAGMA table_info(users)")]:
+            c.execute("ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email <> ''")
         if not c.execute("SELECT 1 FROM payers LIMIT 1").fetchone():
             for name in ["Aetna", "Cigna / Evernorth", "UnitedHealthcare / Optum",
                          "Blue Cross Blue Shield", "Medicare", "Medicaid", "Other"]:
@@ -234,8 +244,14 @@ def save_practice(data):
 
 
 # ----------------------------------------------------------------------------
-# AUTHENTICATION
+# AUTHENTICATION  (username + password + emailed verification code)
 # ----------------------------------------------------------------------------
+OTP_MINUTES = 10
+OTP_MAX_TRIES = 5
+OTP_RESEND_SECONDS = 60
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
 def hash_pw(password, salt_hex):
     return hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex),
                                PBKDF2_ITERATIONS).hex()
@@ -249,11 +265,25 @@ def password_error(pw):
     return ""
 
 
-def create_user(username, full_name, password, role):
+def valid_email(e):
+    return bool(EMAIL_RE.fullmatch((e or "").strip()))
+
+
+def mask_email(e):
+    name, _, dom = e.partition("@")
+    return f"{name[:1]}{'*' * max(len(name) - 1, 2)}@{dom}"
+
+
+def email_taken(email, exclude_id=None):
+    rows = q("SELECT id FROM users WHERE email=?", (email.strip().lower(),))
+    return any(r["id"] != exclude_id for r in rows)
+
+
+def create_user(username, full_name, password, role, email=""):
     salt = secrets.token_hex(16)
-    x("INSERT INTO users (username, full_name, role, pw_hash, salt, created_at) VALUES (?,?,?,?,?,?)",
+    x("INSERT INTO users (username, full_name, role, pw_hash, salt, created_at, email) VALUES (?,?,?,?,?,?,?)",
       (username.strip().lower(), full_name.strip(), role, hash_pw(password, salt),
-       salt, datetime.now().isoformat(timespec="seconds")))
+       salt, datetime.now().isoformat(timespec="seconds"), email.strip().lower()))
 
 
 def set_password(user_id, password):
@@ -262,7 +292,120 @@ def set_password(user_id, password):
       (hash_pw(password, salt), salt, user_id))
 
 
+# ---- email sending -----------------------------------------------------------
+def smtp_config():
+    """Reads [smtp] from Streamlit secrets. Returns None when not configured."""
+    try:
+        cfg = dict(st.secrets["smtp"])
+    except Exception:
+        return None
+    if not all(cfg.get(k) for k in ("host", "username", "password")):
+        return None
+    return cfg
+
+
+def send_email(to_addr, subject, body):
+    cfg = smtp_config()
+    if not cfg:
+        return False, "Email service is not configured."
+    msg = EmailMessage()
+    msg["From"] = cfg.get("sender") or cfg["username"]
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg.set_content(body)
+    try:
+        port = int(cfg.get("port", 587))
+        if port == 465:
+            with smtplib.SMTP_SSL(cfg["host"], port, timeout=20) as s:
+                s.login(cfg["username"], cfg["password"])
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP(cfg["host"], port, timeout=20) as s:
+                s.starttls()
+                s.login(cfg["username"], cfg["password"])
+                s.send_message(msg)
+        return True, ""
+    except Exception as e:  # never show server details to the user
+        audit("email_send_failed", type(e).__name__, user="-")
+        return False, "Could not send the email. Check the SMTP settings in Secrets."
+
+
+def _otp_hash(code, salt):
+    return hashlib.sha256((salt + code).encode()).hexdigest()
+
+
+def _otp_email_body(code, purpose):
+    what = {"login": "sign in to", "reset": "reset your password for", "email": "confirm your email for",
+            "setup": "confirm your email for"}[purpose]
+    return (f"Your MindBill Pro verification code is:\n\n    {code}\n\n"
+            f"Use it to {what} MindBill Pro. It expires in {OTP_MINUTES} minutes.\n"
+            f"If you did not request this, ignore this email and do not share the code.")
+
+
+# ---- codes stored in the database (login / password reset) -------------------
+def issue_otp(user, purpose):
+    last = q("SELECT created_at FROM otp_codes WHERE user_id=? AND purpose=? ORDER BY id DESC LIMIT 1",
+             (user["id"], purpose))
+    if last and (datetime.now() - datetime.fromisoformat(last[0]["created_at"])).total_seconds() < OTP_RESEND_SECONDS:
+        return False, f"Please wait {OTP_RESEND_SECONDS} seconds before requesting another code."
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    salt = secrets.token_hex(8)
+    now = datetime.now()
+    x("UPDATE otp_codes SET used=1 WHERE user_id=? AND purpose=?", (user["id"], purpose))
+    otp_id = x("INSERT INTO otp_codes (user_id, purpose, code_hash, salt, created_at, expires_at) "
+               "VALUES (?,?,?,?,?,?)",
+               (user["id"], purpose, _otp_hash(code, salt), salt, now.isoformat(),
+                (now + timedelta(minutes=OTP_MINUTES)).isoformat()))
+    ok, err = send_email(user["email"], "Your MindBill Pro verification code", _otp_email_body(code, purpose))
+    if not ok:
+        x("UPDATE otp_codes SET used=1 WHERE id=?", (otp_id,))
+        return False, err
+    return True, ""
+
+
+def check_otp(user_id, purpose, code):
+    rows = q("SELECT * FROM otp_codes WHERE user_id=? AND purpose=? AND used=0 ORDER BY id DESC LIMIT 1",
+             (user_id, purpose))
+    if not rows:
+        return False, "No active code. Request a new one."
+    r = rows[0]
+    if datetime.fromisoformat(r["expires_at"]) < datetime.now():
+        x("UPDATE otp_codes SET used=1 WHERE id=?", (r["id"],))
+        return False, "Code expired. Request a new one."
+    if r["attempts"] >= OTP_MAX_TRIES:
+        x("UPDATE otp_codes SET used=1 WHERE id=?", (r["id"],))
+        return False, "Too many wrong attempts. Request a new code."
+    if hmac.compare_digest(_otp_hash(code.strip(), r["salt"]), r["code_hash"]):
+        x("UPDATE otp_codes SET used=1 WHERE id=?", (r["id"],))
+        return True, ""
+    x("UPDATE otp_codes SET attempts=attempts+1 WHERE id=?", (r["id"],))
+    return False, "Incorrect code."
+
+
+# ---- temporary codes kept in the session (setup / email change) --------------
+def send_temp_code(email, purpose):
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    salt = secrets.token_hex(8)
+    ok, err = send_email(email, "Your MindBill Pro verification code", _otp_email_body(code, purpose))
+    state = {"salt": salt, "hash": _otp_hash(code, salt), "tries": 0,
+             "expires": (datetime.now() + timedelta(minutes=OTP_MINUTES)).isoformat()}
+    return ok, err, state
+
+
+def verify_temp_code(state, code):
+    if datetime.fromisoformat(state["expires"]) < datetime.now():
+        return False, "Code expired. Start over."
+    if state["tries"] >= OTP_MAX_TRIES:
+        return False, "Too many wrong attempts. Start over."
+    state["tries"] += 1
+    if hmac.compare_digest(_otp_hash(code.strip(), state["salt"]), state["hash"]):
+        return True, ""
+    return False, "Incorrect code."
+
+
+# ---- password check ------------------------------------------------------------
 def authenticate(username, password):
+    """Checks username + password only. Returns (user, error)."""
     uname = username.strip().lower()
     rows = q("SELECT * FROM users WHERE username=?", (uname,))
     if not rows:
@@ -276,7 +419,6 @@ def authenticate(username, password):
         return None, "Account temporarily locked after too many attempts. Try again later."
     if hmac.compare_digest(hash_pw(password, u["salt"]), u["pw_hash"]):
         x("UPDATE users SET failed_attempts=0, locked_until=NULL WHERE id=?", (u["id"],))
-        audit("login", user=uname)
         return u, ""
     n = u["failed_attempts"] + 1
     locked = None
@@ -286,6 +428,18 @@ def authenticate(username, password):
     x("UPDATE users SET failed_attempts=?, locked_until=? WHERE id=?", (n, locked, u["id"]))
     audit("login_failed", "bad password" + (" - account locked" if locked else ""), user=uname)
     return None, "Invalid username or password."
+
+
+def finish_login(user):
+    if not user["active"]:
+        st.error("This account is disabled.")
+        return
+    st.session_state.clear()
+    st.session_state["user"] = {"id": user["id"], "username": user["username"],
+                                "full_name": user["full_name"], "role": user["role"]}
+    st.session_state["last_active"] = datetime.now()
+    audit("login", user=user["username"])
+    st.rerun()
 
 
 def enforce_session():
@@ -302,46 +456,189 @@ def enforce_session():
     return True
 
 
+# ---- login screens -------------------------------------------------------------
+def setup_step():
+    pending = st.session_state.get("setup")
+    if pending:
+        st.info(f"We sent a 6-digit code to {mask_email(pending['email'])} to confirm your email.")
+        with st.form("setup_code"):
+            code = st.text_input("Verification code", max_chars=6)
+            confirm = st.form_submit_button("Confirm & create admin")
+        if confirm:
+            ok, msg = verify_temp_code(pending["otp"], code)
+            if ok:
+                create_user(pending["username"], pending["name"], pending["pw"], "admin", pending["email"])
+                audit("admin_created", pending["username"], user=pending["username"])
+                st.session_state.pop("setup")
+                st.session_state["flash"] = "Admin account created. Sign in below."
+                st.rerun()
+            else:
+                st.error(msg)
+        if st.button("Start over"):
+            st.session_state.pop("setup")
+            st.rerun()
+        return
+
+    st.info("First-time setup: create the administrator account.")
+    with st.form("setup"):
+        name = st.text_input("Full name")
+        username = st.text_input("Username")
+        email = st.text_input("Email (verification codes are sent here)")
+        pw = st.text_input("Password", type="password", help=PW_HELP)
+        pw2 = st.text_input("Confirm password", type="password")
+        go = st.form_submit_button("Continue")
+    if not go:
+        return
+    if not (name.strip() and username.strip() and pw):
+        st.error("Fill in all fields.")
+    elif not valid_email(email):
+        st.error("Enter a valid email address.")
+    elif pw != pw2:
+        st.error("Passwords do not match.")
+    elif password_error(pw):
+        st.error(password_error(pw))
+    elif smtp_config():
+        ok, err, otp = send_temp_code(email.strip().lower(), "setup")
+        if ok:
+            st.session_state["setup"] = {"name": name, "username": username, "email": email.strip().lower(),
+                                         "pw": pw, "otp": otp}
+            st.rerun()
+        else:
+            st.error(err)
+    else:
+        create_user(username, name, pw, "admin", email)
+        audit("admin_created", username.strip().lower(), user=username.strip().lower())
+        st.session_state["flash"] = "Admin account created. Sign in below."
+        st.rerun()
+
+
+def password_step():
+    with st.form("login"):
+        username = st.text_input("Username")
+        pw = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in")
+    if submitted:
+        user, err = authenticate(username, pw)
+        if not user:
+            st.error(err)
+        elif smtp_config() and user["email"]:
+            ok, msg = issue_otp(user, "login")
+            if ok:
+                st.session_state.update(auth_mode="otp", pending_user_id=user["id"])
+                st.rerun()
+            else:
+                st.error(msg)
+        else:
+            finish_login(user)
+    if st.button("Forgot password?"):
+        st.session_state["auth_mode"] = "reset_request"
+        st.rerun()
+
+
+def otp_step():
+    uid = st.session_state.get("pending_user_id")
+    rows = q("SELECT * FROM users WHERE id=?", (uid,)) if uid else []
+    if not rows:
+        st.session_state["auth_mode"] = "login"
+        st.rerun()
+    user = rows[0]
+    st.info(f"We sent a 6-digit code to {mask_email(user['email'])}. It expires in {OTP_MINUTES} minutes.")
+    with st.form("otp"):
+        code = st.text_input("Verification code", max_chars=6)
+        verify = st.form_submit_button("Verify & sign in")
+    if verify:
+        ok, msg = check_otp(uid, "login", code)
+        if ok:
+            finish_login(user)
+        else:
+            audit("otp_failed", msg, user=user["username"])
+            st.error(msg)
+    c1, c2 = st.columns(2)
+    if c1.button("Resend code"):
+        ok, msg = issue_otp(user, "login")
+        st.success("A new code was sent.") if ok else st.error(msg)
+    if c2.button("Back"):
+        st.session_state.pop("pending_user_id", None)
+        st.session_state["auth_mode"] = "login"
+        st.rerun()
+
+
+def reset_request_step():
+    st.subheader("Reset password")
+    if not smtp_config():
+        st.error("Email service is not configured. Ask your administrator to reset your password.")
+    else:
+        with st.form("reset_req"):
+            email = st.text_input("Email address on your account")
+            go = st.form_submit_button("Send code")
+        if go:
+            email = email.strip().lower()
+            rows = q("SELECT * FROM users WHERE email=? AND active=1", (email,)) if valid_email(email) else []
+            if rows:
+                issue_otp(rows[0], "reset")
+                audit("password_reset_requested", user=rows[0]["username"])
+            st.session_state.update(auth_mode="reset_verify", reset_email=email)
+            st.rerun()
+    if st.button("Back to sign in"):
+        st.session_state["auth_mode"] = "login"
+        st.rerun()
+
+
+def reset_verify_step():
+    st.subheader("Reset password")
+    st.info("If that email is registered, a 6-digit code has been sent. Enter it with your new password.")
+    with st.form("reset_verify"):
+        code = st.text_input("Verification code", max_chars=6)
+        new = st.text_input("New password", type="password", help=PW_HELP)
+        new2 = st.text_input("Confirm new password", type="password")
+        go = st.form_submit_button("Reset password")
+    if go:
+        rows = q("SELECT * FROM users WHERE email=? AND active=1", (st.session_state.get("reset_email", ""),))
+        if new != new2:
+            st.error("Passwords do not match.")
+        elif password_error(new):
+            st.error(password_error(new))
+        elif not rows:
+            st.error("Invalid or expired code.")
+        else:
+            ok, msg = check_otp(rows[0]["id"], "reset", code)
+            if ok:
+                set_password(rows[0]["id"], new)
+                audit("password_reset_email", user=rows[0]["username"])
+                st.session_state.clear()
+                st.session_state["flash"] = "Password updated. Sign in with your new password."
+                st.rerun()
+            else:
+                st.error(msg)
+    if st.button("Back to sign in"):
+        st.session_state["auth_mode"] = "login"
+        st.rerun()
+
+
 def login_screen():
     _, mid, _ = st.columns([1, 1.4, 1])
     with mid:
         st.markdown("## 🧠 MindBill Pro")
         st.caption("Behavioral Health Denial & Appeal Manager")
         if st.session_state.get("flash"):
-            st.warning(st.session_state.pop("flash"))
+            st.info(st.session_state.pop("flash"))
         st.markdown("---")
 
         if not q("SELECT 1 FROM users LIMIT 1"):
-            st.info("First-time setup: create the administrator account.")
-            with st.form("setup"):
-                name = st.text_input("Full name")
-                username = st.text_input("Username")
-                pw = st.text_input("Password", type="password", help=PW_HELP)
-                pw2 = st.text_input("Confirm password", type="password")
-                if st.form_submit_button("Create admin account"):
-                    err = ("Fill in all fields." if not (name.strip() and username.strip() and pw)
-                           else "Passwords do not match." if pw != pw2
-                           else password_error(pw))
-                    if err:
-                        st.error(err)
-                    else:
-                        create_user(username, name, pw, "admin")
-                        audit("admin_created", username, user=username.strip().lower())
-                        st.success("Admin created. You can sign in now.")
-                        st.rerun()
+            setup_step()
+            return
+        if not smtp_config():
+            st.warning("Email verification is OFF because the email (SMTP) settings are missing. "
+                       "Add them under Settings → Secrets to turn it on.")
+        mode = st.session_state.get("auth_mode", "login")
+        if mode == "otp":
+            otp_step()
+        elif mode == "reset_request":
+            reset_request_step()
+        elif mode == "reset_verify":
+            reset_verify_step()
         else:
-            with st.form("login"):
-                username = st.text_input("Username")
-                pw = st.text_input("Password", type="password")
-                if st.form_submit_button("Sign in"):
-                    user, err = authenticate(username, pw)
-                    if user:
-                        st.session_state["user"] = {"id": user["id"], "username": user["username"],
-                                                    "full_name": user["full_name"], "role": user["role"]}
-                        st.session_state["last_active"] = datetime.now()
-                        st.rerun()
-                    else:
-                        st.error(err)
+            password_step()
         st.caption(f"Sessions expire after {SESSION_TIMEOUT_MIN} minutes of inactivity.")
 
 
@@ -894,7 +1191,7 @@ def page_practice():
 
 def page_users():
     st.title("Users")
-    users = q("SELECT id, username, full_name, role, active, locked_until, created_at FROM users ORDER BY username")
+    users = q("SELECT id, username, full_name, email, role, active, locked_until, created_at FROM users ORDER BY username")
     st.dataframe(pd.DataFrame(users), hide_index=True)
 
     st.subheader("Add user")
@@ -903,20 +1200,24 @@ def page_users():
         name = c1.text_input("Full name")
         username = c2.text_input("Username")
         c1, c2 = st.columns(2)
-        pw = c1.text_input("Temporary password", type="password", help=PW_HELP)
+        email = c1.text_input("Email (verification codes go here)")
         role = c2.selectbox("Role", ["biller", "admin"])
+        pw = st.text_input("Temporary password", type="password", help=PW_HELP)
         if st.form_submit_button("Create user"):
-            err = "Fill in all fields." if not (name.strip() and username.strip() and pw) else password_error(pw)
+            err = ("Fill in all fields." if not (name.strip() and username.strip() and pw)
+                   else "Enter a valid email address." if not valid_email(email)
+                   else "That email is already used by another user." if email_taken(email)
+                   else password_error(pw))
             if err:
                 st.error(err)
             else:
                 try:
-                    create_user(username, name, pw, role)
+                    create_user(username, name, pw, role, email)
                     audit("user_created", f"{username.strip().lower()} ({role})")
                     st.success("User created.")
                     st.rerun()
                 except sqlite3.IntegrityError:
-                    st.error("That username already exists.")
+                    st.error("That username or email already exists.")
 
     st.subheader("Manage user")
     me = st.session_state["user"]["id"]
@@ -933,6 +1234,17 @@ def page_users():
                 audit("password_reset", target["username"])
                 st.success("Password reset.")
     with c2:
+        new_email = st.text_input("Set email", value=target.get("email", ""), key=f"em_{target['id']}")
+        if st.button("Save email"):
+            if not valid_email(new_email):
+                st.error("Enter a valid email address.")
+            elif email_taken(new_email, exclude_id=target["id"]):
+                st.error("That email is already used by another user.")
+            else:
+                x("UPDATE users SET email=? WHERE id=?", (new_email.strip().lower(), target["id"]))
+                audit("user_email_set", target["username"])
+                st.success("Email saved.")
+                st.rerun()
         if target["id"] == me:
             st.caption("You cannot disable your own account.")
         else:
@@ -977,6 +1289,52 @@ with st.sidebar:
     st.caption(f"{user['role'].title()} · auto-logout after {SESSION_TIMEOUT_MIN} min")
     choice = st.radio("Navigate", list(PAGES), label_visibility="collapsed")
     st.markdown("---")
+    my_email = q("SELECT email FROM users WHERE id=?", (user["id"],))[0]["email"]
+    if smtp_config() and not my_email:
+        st.warning("Add your email below to turn on verification codes for your account.")
+    with st.expander("My email (verification codes)"):
+        st.caption(mask_email(my_email) if my_email else "No email set")
+        pending = st.session_state.get("email_change")
+        if pending:
+            st.info(f"Enter the code sent to {mask_email(pending['email'])}.")
+            with st.form("chemail_code"):
+                ecode = st.text_input("Code", max_chars=6)
+                if st.form_submit_button("Confirm email"):
+                    ok, msg = verify_temp_code(pending["otp"], ecode)
+                    if ok:
+                        x("UPDATE users SET email=? WHERE id=?", (pending["email"], user["id"]))
+                        audit("email_changed")
+                        st.session_state.pop("email_change")
+                        st.rerun()
+                    else:
+                        st.error(msg)
+            if st.button("Cancel email change"):
+                st.session_state.pop("email_change")
+                st.rerun()
+        else:
+            with st.form("chemail"):
+                new_email = st.text_input("New email")
+                cur_pw = st.text_input("Current password", type="password")
+                if st.form_submit_button("Update email"):
+                    row = q("SELECT * FROM users WHERE id=?", (user["id"],))[0]
+                    if not hmac.compare_digest(hash_pw(cur_pw, row["salt"]), row["pw_hash"]):
+                        st.error("Current password is wrong.")
+                    elif not valid_email(new_email):
+                        st.error("Enter a valid email address.")
+                    elif email_taken(new_email, exclude_id=user["id"]):
+                        st.error("That email is already used by another user.")
+                    elif smtp_config():
+                        ok, err, otp = send_temp_code(new_email.strip().lower(), "email")
+                        if ok:
+                            st.session_state["email_change"] = {"email": new_email.strip().lower(), "otp": otp}
+                            st.rerun()
+                        else:
+                            st.error(err)
+                    else:
+                        x("UPDATE users SET email=? WHERE id=?", (new_email.strip().lower(), user["id"]))
+                        audit("email_changed")
+                        st.success("Email saved.")
+                        st.rerun()
     with st.expander("Change my password"):
         with st.form("chpw", clear_on_submit=True):
             cur = st.text_input("Current password", type="password")
